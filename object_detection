@@ -1,0 +1,276 @@
+#include <opencv2/core/core.hpp>
+#include <opencv2/imgproc/imgproc.hpp>
+#include <opencv2/highgui/highgui.hpp>
+#include <opencv2/video/tracking.hpp>
+#include <iostream>
+unsigned char codec[4];
+
+// The frame processor interface
+class FP
+{
+public:
+	// virtual method
+	virtual void processFrame(cv::Mat& input, cv::Mat& output)
+	{
+		return; //dummy implementation, may be overridden by derived class
+	}
+};
+
+class FeatureTracker : public FP
+{
+private:
+	cv::Mat grey; // current grey-level image
+	cv::Mat grey_prev; // previous grey-level image
+	// tracked features from points[0]-> points[1]
+	std::vector<cv::Point2f> points[2]; // feature points in prev and current frame
+	std::vector<cv::Point2f> initial; // starting position of the tracks
+	std::vector<cv::Point2f> features; // detected feature points
+	int max_count; // maximum number of features to detect
+	double qlevel; // quality level for feature detection
+	double minDist; // min distance between two points
+	std::vector<uchar> status; // status of tracked features
+	std::vector<float> err; // error in tracking
+public:
+	FeatureTracker() : max_count(500), qlevel(0.01), minDist(10.0) {}
+	void processFrame(cv::Mat& frame, cv::Mat& output);
+	bool needNewPoints();
+	void detectNewPoints();
+	bool acceptTrackedPoint(int i);
+	void drawTrackedPoints(cv::Mat& output);
+};
+
+void FeatureTracker::processFrame(cv::Mat& frame, cv::Mat& output)
+{
+	// convert input to grey-level image
+	cv::cvtColor(frame, grey, CV_BGR2GRAY); // grey is new frame to be processed
+	frame.copyTo(output);
+	// 1. if new feature points must be added
+	if (needNewPoints()) // if enough features points in points[0]
+	{
+		// detect feature points in grey; output in features
+		detectNewPoints();
+		// append the detected features to
+		// the currently tracked features
+		points[0].insert(points[0].end(), features.begin(), features.end());
+		initial.insert(initial.end(), features.begin(), features.end());
+	}
+	// for first image of the sequence
+	if (grey_prev.empty()) grey.copyTo(grey_prev);
+	// 2. track features
+	cv::calcOpticalFlowPyrLK(
+		grey_prev, grey, // 2 consecutive images
+		points[0], // feature point positions in the previous image
+		points[1], // feature point positions in the current image
+		status, // tracking success
+		err); // tracking error
+		// 2. loop over the tracked points to reject some of them
+	int k = 0;
+	for (int i = 0; i < points[1].size(); i++)
+	{
+		// do we keep this point?
+		if (acceptTrackedPoint(i)) {
+			// keep and repack this point in vector
+			initial[k] = initial[i];
+			points[1][k] = points[1][i];
+			k++;
+		}
+	}
+	// eliminate unsuccessful points
+	points[1].resize(k);
+	initial.resize(k);
+	// 3. draw the accepted tracked points
+	drawTrackedPoints(output);
+	// 4. current points and image become previous ones
+	std::swap(points[1], points[0]);
+	cv::swap(grey_prev, grey);
+}
+
+// determine if new points should be added
+bool FeatureTracker::needNewPoints()
+{
+	// too few points in the previous frame
+	return points[0].size() <= 10;
+}
+
+// feature point detection
+void FeatureTracker::detectNewPoints()
+{
+	// detect the features
+	cv::goodFeaturesToTrack(grey, // the image
+		features, // the output detected features
+		max_count, // the maximum number of features
+		qlevel, // quality level
+		minDist); // min distance between two features
+}
+
+
+// determine which tracked point should be accepted
+// status is from calcOpticalFlowPyrLK
+bool FeatureTracker::acceptTrackedPoint(int i) // i is the index of feature points
+{
+	return status[i] &&
+		// if it is a moving point (difference between the previous and current frame)
+		(abs(points[0][i].x - points[1][i].x) +
+			(abs(points[0][i].y - points[1][i].y)) > 2);
+}
+
+
+// handle the currently tracked points
+void FeatureTracker::drawTrackedPoints(cv::Mat& output)
+{
+	// for all tracked points
+	for (int i = 0; i < points[1].size(); i++)
+	{
+		// draw line and circle
+		cv::line(output, initial[i], // initial starting position
+			points[1][i],// new position of the point tracked
+			cv::Scalar(255, 255, 255));
+		cv::circle(output, points[1][i], // new position
+			3, cv::Scalar(255, 255, 255), -1);
+	}
+}
+
+
+
+class VideoController
+{
+private:
+	cv::VideoWriter wri;
+	std::string outputFile;
+
+	std::string filename;
+	int delay;
+	FP* fp; // pointer of the frame processing class
+	cv::VideoCapture cap;
+public:
+	bool setInput(std::string filename);
+	int getCodec(unsigned char codec[4]);
+	bool setOutput(const std::string& filename, int codec = 0, double framerate = 0.0, bool isColor = true);
+	void setDelay(int d);
+	void setFrameProcessor(FP* f); // pass in FP pointer
+	void run();
+
+
+};
+
+bool VideoController::setInput(std::string f)
+{
+	filename = f;
+	if (!cap.open(filename)) return false;
+	else return true;
+}
+
+bool VideoController::setOutput(const std::string& filename, int codec, double
+	framerate, bool isColor)
+{
+	outputFile = filename;
+	if (framerate == 0.0) {
+		framerate = cap.get(CV_CAP_PROP_FPS); // get the framerate f input file
+	}
+	int width = static_cast<int>(cap.get(CV_CAP_PROP_FRAME_WIDTH));
+	int height = static_cast<int>(cap.get(CV_CAP_PROP_FRAME_HEIGHT));
+	cv::Size sz(width, height);
+	unsigned char c[4];
+	// use same codec as input
+	if (codec == 0)
+	{
+		codec = getCodec(c);
+	}
+	// Open output video
+	return wri.open(outputFile, // filename
+		codec, // codec to be used
+		framerate, // frame rate of the video
+		sz, // frame size
+		false); // color video?
+}
+
+
+void VideoController::setDelay(int d)
+{
+	if (d == 0)
+	{
+		double rate = cap.get(CV_CAP_PROP_FPS);
+		delay = static_cast<int>(1000 / rate);
+	}
+	else
+	{
+		delay = d;
+	}
+}
+
+
+void VideoController::setFrameProcessor(FP* f)
+{
+	fp = f;
+}
+
+
+// get the codec of input video
+// get the codec of input video
+int VideoController::getCodec(unsigned char codec[4])
+{
+	union
+	{ // data structure for the 4-char code
+		unsigned int value;
+		unsigned char code[4];
+	} fourcc;
+	// get the code
+	fourcc.value = static_cast<int>(cap.get(CV_CAP_PROP_FOURCC));
+	// get the 4 characters
+	codec[0] = fourcc.code[0];
+	codec[1] = fourcc.code[1];
+	codec[2] = fourcc.code[2];
+	codec[3] = fourcc.code[3];
+	// return the int value corresponding to the code
+	return fourcc.value;
+}
+
+
+void processFrame(cv::Mat& in, cv::Mat& out)
+{
+	out = in;
+	// Convert to grey
+	if (in.channels() == 3)
+		cv::cvtColor(in, out, CV_BGR2GRAY);
+	// Compute Canny edges
+	cv::Canny(out, out, 100, 200);
+	// Invert the image
+	cv::threshold(out, out, 128, 255, cv::THRESH_BINARY_INV);
+}
+
+
+void VideoController::run()
+{
+	cv::Mat frame;
+	while (true)
+	{
+		// read next frame if any
+		if (!cap.read(frame))
+			break;
+		if (fp)
+			fp->processFrame(frame, frame); // process the frame
+		cv::imshow("Output Video", frame);
+		wri.write(frame); // new step
+		// introduce a delay, or press key to stop
+		if (cv::waitKey(delay) >= 0)
+			break;
+	}
+}
+
+
+
+int main()
+{
+	// Create video procesor instance
+	VideoController vid;
+	// Create feature tracker instance
+	FeatureTracker tracker;
+	// Open video file
+	vid.setInput("Flying Display.mp4");
+	// set frame processor
+	vid.setFrameProcessor(&tracker);
+	// Play the video at the original frame rate
+	vid.setDelay(0);
+	// Start the process
+	vid.run();
+}
